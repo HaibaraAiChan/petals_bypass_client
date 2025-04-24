@@ -128,15 +128,34 @@ class _ServerInferenceSession:
         # serialize inputs and put them into the queue
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
 
+        # Profiling: Log input tensor details
+        hidden_states_size_bytes = inputs.element_size() * inputs.nelement()
+        logger.info(
+            f"[PROFILING] Client-to-Server Transmission: "
+            f"To server {self.span.peer_id.to_base58()}, "
+            f"Session: {self.session_id}, "
+            f"Step: {step_id}, "
+            f"Hidden States Shape: {inputs.shape}, "
+            f"Size: {hidden_states_size_bytes / (1024*1024):.2f} MB"
+        )
+
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)
         if self._position is not None:
             request_metadata["start_from_position"] = self._position
-        elif self.config.use_server_to_server:
+        if self.config.use_server_to_server:
             next_servers = self._collect_next_servers()
             if next_servers:
                 request_metadata["next_servers"] = next_servers
+                logger.info(
+                    f"[PROFILING] Server-to-Server Enabled: "
+                    f"Next servers: {[server[0] for server in next_servers]}"
+                )
+            else:
+                logger.info("[PROFILING] Server-to-Server Disabled: No next servers available")
+        else:
+            logger.info("[PROFILING] Server-to-Server Disabled: Configuration setting")
 
         request_metadata["args_structure"] = args_structure
 
@@ -174,7 +193,7 @@ class _ServerInferenceSession:
     def _collect_next_servers(self) -> List[Tuple[str, str, int, int]]:
         next_servers = []
         session = self.next_session
-        while session is not None and session.stepped:
+        while session is not None:
             next_servers.append(
                 (session.span.peer_id.to_base58(), session.session_id, session.span.start, session.span.end)
             )
@@ -185,7 +204,55 @@ class _ServerInferenceSession:
         """Inference step on serialized data. This code is meant to be run inside RemoteExpertWorker"""
         await self._inputs_queue.put(inputs_serialized)
         self.stepped = True
-        return await asyncio.wait_for(anext(self._outputs_stream), self.config.request_timeout)
+        
+        # Profiling: Record start time
+        start_time = time.time()
+        
+        response = await asyncio.wait_for(anext(self._outputs_stream), self.config.request_timeout)
+        
+        # Profiling: Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # 安全地获取 step_id
+        step_id = 'unknown'
+        try:
+            # 尝试反序列化 metadata
+            if hasattr(inputs_serialized, 'metadata') and inputs_serialized.metadata:
+                metadata_dict = MSGPackSerializer.loads(inputs_serialized.metadata)
+                if isinstance(metadata_dict, dict) and 'step_id' in metadata_dict:
+                    step_id = metadata_dict['step_id']
+        except Exception as e:
+            logger.debug(f"Failed to parse metadata: {e}")
+        
+        # Profiling: Log output tensor details if available
+        if response.tensors and len(response.tensors) > 0:
+            output_tensor = response.tensors[0]
+            output_size_bytes = 0
+            
+            # 尝试多种方式获取数据大小
+            if hasattr(output_tensor, 'data'):
+                output_size_bytes = len(output_tensor.data)
+            elif hasattr(output_tensor, 'serialized_data'):
+                output_size_bytes = len(output_tensor.serialized_data)
+            elif hasattr(output_tensor, 'buffer'):
+                output_size_bytes = len(output_tensor.buffer)
+                
+            logger.info(
+                f"[PROFILING] Server-to-Client Transmission: "
+                f"From server {self.span.peer_id.to_base58()}, "
+                f"Session: {self.session_id}, "
+                f"Step: {step_id}, "
+                f"Size: {output_size_bytes / (1024*1024):.2f} MB, "
+                f"Processing Time: {processing_time*1000:.2f} ms, "
+                f"Throughput: {output_size_bytes / (1024*1024) / processing_time:.2f} MB/s" if output_size_bytes > 0 else
+                f"[PROFILING] Server-to-Client Transmission: "
+                f"From server {self.span.peer_id.to_base58()}, "
+                f"Session: {self.session_id}, "
+                f"Step: {step_id}, "
+                f"Processing Time: {processing_time*1000:.2f} ms"
+            )
+        
+        return response
 
     def close(self):
         """Finish a given inference session, close the underlying connection"""
@@ -230,6 +297,21 @@ class InferenceSession:
         self._max_length = max_length
         self.output_ids = None
         self.past_key_values = None
+        
+        # Profiling: Initialize statistics
+        self._total_tokens = 0
+        self._total_e2e_time = 0
+        self._total_server_time = 0
+        self._total_transmission_time = 0
+        self._step_count = 0
+        
+        # Profiling: Initialize latency tracking
+        self._latency_stats = {
+            "e2e": [],
+            "server": [],
+            "transmission": [],
+            "per_token": []
+        }
 
     @property
     def num_blocks(self) -> int:
@@ -290,6 +372,9 @@ class InferenceSession:
         assert not self._closed
         if torch.is_grad_enabled():
             logger.warning("Running inference session with grad enabled. Gradients will *not* be propagated correctly.")
+
+        # Profiling: Record start time for end-to-end latency
+        e2e_start_time = time.time()
 
         if prompts is None or is_dummy(prompts):
             prompts = DUMMY
@@ -359,6 +444,39 @@ class InferenceSession:
         self._position += n_input_tokens
         outputs = inputs[:, -n_input_tokens:]
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype)
+        
+        # Profiling: Calculate end-to-end latency
+        e2e_latency = time.time() - e2e_start_time
+        
+        # Profiling: Update statistics
+        self._total_tokens += n_input_tokens
+        self._total_e2e_time += e2e_latency
+        self._step_count += 1
+        self._latency_stats["e2e"].append(e2e_latency)
+        self._latency_stats["per_token"].append(e2e_latency / n_input_tokens)
+        
+        # Profiling: Log end-to-end latency
+        logger.info(
+            f"[PROFILING] End-to-End Latency: "
+            f"Session: {self._server_sessions[0].session_id if self._server_sessions else 'unknown'}, "
+            f"Step: {step_id}, "
+            f"Total Time: {e2e_latency*1000:.2f} ms, "
+            f"Tokens: {n_input_tokens}, "
+            f"Latency per Token: {e2e_latency*1000/n_input_tokens:.2f} ms/token"
+        )
+        
+        # Profiling: Log cumulative statistics
+        if self._step_count % 10 == 0 or self._step_count == 1:  # Log every 10 steps or on first step
+            avg_e2e_latency = self._total_e2e_time / self._step_count
+            avg_per_token = self._total_e2e_time / self._total_tokens
+            logger.info(
+                f"[PROFILING] Cumulative Statistics: "
+                f"Steps: {self._step_count}, "
+                f"Total Tokens: {self._total_tokens}, "
+                f"Avg E2E Latency: {avg_e2e_latency*1000:.2f} ms, "
+                f"Avg Latency per Token: {avg_per_token*1000:.2f} ms/token"
+            )
+        
         return outputs
 
     def _update_sequence(self, server_idx: int, block_idx: int, attempt_no: int) -> int:
@@ -387,12 +505,32 @@ class InferenceSession:
         self._server_sessions[server_idx : server_idx + 1] = updated_sessions
 
         # Update links to the next server session for direct server-to-server communication via rpc_push()
-        for i in range(max(server_idx - 1, 0), min(server_idx + len(updated_spans), len(self._server_sessions) - 1)):
+        # Ensure all server sessions are properly linked
+        for i in range(len(self._server_sessions) - 1):
             self._server_sessions[i].next_session = self._server_sessions[i + 1]
 
     def close(self, *exc_details):
         """Finish a given inference session, close the underlying connection"""
         if not self._closed:
+            # Profiling: Log final statistics
+            if self._step_count > 0:
+                avg_e2e_latency = self._total_e2e_time / self._step_count
+                avg_per_token = self._total_e2e_time / self._total_tokens
+                min_per_token = min(self._latency_stats["per_token"]) * 1000
+                max_per_token = max(self._latency_stats["per_token"]) * 1000
+                p95_per_token = sorted(self._latency_stats["per_token"])[int(0.95 * len(self._latency_stats["per_token"]))] * 1000
+                
+                logger.info(
+                    f"[PROFILING] Final Statistics: "
+                    f"Steps: {self._step_count}, "
+                    f"Total Tokens: {self._total_tokens}, "
+                    f"Avg E2E Latency: {avg_e2e_latency*1000:.2f} ms, "
+                    f"Avg Latency per Token: {avg_per_token*1000:.2f} ms/token, "
+                    f"Min Latency per Token: {min_per_token:.2f} ms/token, "
+                    f"Max Latency per Token: {max_per_token:.2f} ms/token, "
+                    f"P95 Latency per Token: {p95_per_token:.2f} ms/token"
+                )
+            
             self._exit_server_sessions(self._server_sessions)
             self._server_sessions.clear()
             self._closed = True
