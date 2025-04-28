@@ -3,6 +3,7 @@ Utility functions that call RPC forward or backward on a single remote server
 """
 import asyncio
 from typing import Iterable, List, Optional, Sequence, Tuple
+import time
 
 import torch
 from hivemind import nested_compare, nested_flatten, nested_pack, serialize_torch_tensor
@@ -102,11 +103,53 @@ async def run_remote_forward(
         )
     )
 
+    # Profiling: Log input tensor details
+    input_size_bytes = sum(tensor.element_size() * tensor.nelement() for tensor in inputs)
+    logger = config.logger if hasattr(config, 'logger') else __import__('logging').getLogger(__name__)
+    step_id = None
+    if metadata is not None:
+        try:
+            import hivemind
+            meta_dict = hivemind.MSGPackSerializer.loads(metadata)
+            step_id = meta_dict.get('step_id', None)
+        except Exception:
+            pass
+    logger.info(
+        f"[PROFILING] Remote Forward: "
+        f"UID: {uid}, "
+        f"Step: {step_id}, "
+        f"Input Size: {input_size_bytes / (1024*1024):.2f} MB"
+    )
+    for i, tensor in enumerate(inputs):
+        logger.info(
+            f"[PROFILING] Remote Forward Input Tensor {i}: "
+            f"shape={getattr(tensor, 'shape', None)}, "
+            f"dtype={getattr(tensor, 'dtype', None)}, "
+            f"size={tensor.element_size() * tensor.nelement() / (1024*1024):.2f} MB"
+        )
     # call RPC on remote server
+    start_time = time.time()
     size = sum(t.element_size() * t.nelement() for t in inputs)
     forward_fn = _forward_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else _forward_unary
-    # Hotfix: we use "// 2" since hivemind==1.1.5 serializes bfloat16 tensors in float32, so they take 2x more space
     deserialized_outputs = await forward_fn(uid, serialized_tensors, stub, config, metadata=metadata, **kwargs)
+    latency = time.time() - start_time
+    output_size_bytes = sum(t.element_size() * t.nelement() for t in deserialized_outputs if hasattr(t, 'element_size'))
+    logger.info(
+        f"[PROFILING] Remote Forward Done: "
+        f"UID: {uid}, "
+        f"Step: {step_id}, "
+        f"Output Size: {output_size_bytes / (1024*1024):.2f} MB, "
+        f"Latency: {latency*1000:.2f} ms, "
+        f"Throughput: {output_size_bytes / (1024*1024) / latency:.2f} MB/s" if output_size_bytes > 0 else
+        f"Latency: {latency*1000:.2f} ms"
+    )
+    for i, tensor in enumerate(deserialized_outputs):
+        logger.info(
+            f"[PROFILING] Remote Forward Output Tensor {i}: "
+            f"shape={getattr(tensor, 'shape', None)}, "
+            f"dtype={getattr(tensor, 'dtype', None)}, "
+            f"size={tensor.element_size() * tensor.nelement() / (1024*1024):.2f} MB"
+        )
     return nested_pack(deserialized_outputs, structure=rpc_info["outputs_schema"])
 
 
@@ -142,8 +185,50 @@ async def run_remote_backward(
         )
     )
 
+    # Profiling: Log input tensor details
+    input_size_bytes = sum(tensor.element_size() * tensor.nelement() for tensor in inputs_and_grad_outputs)
+    logger = config.logger if hasattr(config, 'logger') else __import__('logging').getLogger(__name__)
+    step_id = None
+    if metadata is not None:
+        try:
+            import hivemind
+            meta_dict = hivemind.MSGPackSerializer.loads(metadata)
+            step_id = meta_dict.get('step_id', None)
+        except Exception:
+            pass
+    logger.info(
+        f"[PROFILING] Remote Backward: "
+        f"UID: {uid}, "
+        f"Step: {step_id}, "
+        f"Input Size: {input_size_bytes / (1024*1024):.2f} MB"
+    )
+    for i, tensor in enumerate(inputs_and_grad_outputs):
+        logger.info(
+            f"[PROFILING] Remote Backward Input Tensor {i}: "
+            f"shape={getattr(tensor, 'shape', None)}, "
+            f"dtype={getattr(tensor, 'dtype', None)}, "
+            f"size={tensor.element_size() * tensor.nelement() / (1024*1024):.2f} MB"
+        )
+    start_time = time.time()
     size = sum(t.element_size() * t.nelement() for t in inputs_and_grad_outputs)
     backward_fn = _backward_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else _backward_unary
-    # Hotfix: we use "// 2" since hivemind==1.1.5 serializes bfloat16 tensors in float32, so they take 2x more space
     deserialized_grad_inputs = await backward_fn(uid, serialized_tensors, stub, config, metadata=metadata, **kwargs)
+    latency = time.time() - start_time
+    output_size_bytes = sum(t.element_size() * t.nelement() for t in deserialized_grad_inputs if hasattr(t, 'element_size'))
+    logger.info(
+        f"[PROFILING] Remote Backward Done: "
+        f"UID: {uid}, "
+        f"Step: {step_id}, "
+        f"Output Size: {output_size_bytes / (1024*1024):.2f} MB, "
+        f"Latency: {latency*1000:.2f} ms, "
+        f"Throughput: {output_size_bytes / (1024*1024) / latency:.2f} MB/s" if output_size_bytes > 0 else
+        f"Latency: {latency*1000:.2f} ms"
+    )
+    for i, tensor in enumerate(deserialized_grad_inputs):
+        logger.info(
+            f"[PROFILING] Remote Backward Output Tensor {i}: "
+            f"shape={getattr(tensor, 'shape', None)}, "
+            f"dtype={getattr(tensor, 'dtype', None)}, "
+            f"size={tensor.element_size() * tensor.nelement() / (1024*1024):.2f} MB"
+        )
     return deserialized_grad_inputs
