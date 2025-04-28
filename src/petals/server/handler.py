@@ -326,35 +326,6 @@ class TransformerConnectionHandler(ConnectionHandler):
         session_id = metadata["session_id"]
         self._log_request("rpc_push", requested_uids, context, debug=f"session_id={session_id}")
         
-        # Profiling: Log received hidden states
-        if request.tensors and len(request.tensors) > 0:
-            hidden_states = request.tensors[0]
-            hidden_states_size_bytes = 0
-            hidden_states_shape = None
-            
-            # 尝试多种方式获取数据大小
-            if hasattr(hidden_states, 'data'):
-                hidden_states_size_bytes = len(hidden_states.data)
-            elif hasattr(hidden_states, 'serialized_data'):
-                hidden_states_size_bytes = len(hidden_states.serialized_data)
-            elif hasattr(hidden_states, 'buffer'):
-                hidden_states_size_bytes = len(hidden_states.buffer)
-                
-            # 尝试获取形状信息
-            if hasattr(hidden_states, 'shape'):
-                hidden_states_shape = hidden_states.shape
-            elif hasattr(hidden_states, 'descriptor') and hasattr(hidden_states.descriptor, 'shape'):
-                hidden_states_shape = hidden_states.descriptor.shape
-                
-            logger.info(
-                f"[PROFILING] Received Hidden States: "
-                f"Session: {session_id}, "
-                f"Step: {metadata.get('step_id')}, "
-                f"Hidden States Shape: {hidden_states_shape}, "
-                f"Size: {hidden_states_size_bytes / (1024*1024):.2f} MB, "
-                f"From: {metadata.get('pushed', False)}"
-            )
-        
         self._put_into_session_queue(session_id, request)
         return runtime_pb2.ExpertResponse()
 
@@ -370,42 +341,11 @@ class TransformerConnectionHandler(ConnectionHandler):
             next_peer_id = PeerID.from_base58(next_peer_id)
             next_uid = CHAIN_DELIMITER.join(f"{self.dht_prefix}{UID_DELIMITER}{i}" for i in range(next_start, next_end))
 
-            # Profiling: Calculate data size - 安全地获取数据大小
-            hidden_states_size_bytes = 0
-            hidden_states_shape = None
-            
-            # 尝试多种方式获取数据大小
-            if hasattr(serialized_outputs, 'data'):
-                hidden_states_size_bytes = len(serialized_outputs.data)
-            elif hasattr(serialized_outputs, 'serialized_data'):
-                hidden_states_size_bytes = len(serialized_outputs.serialized_data)
-            elif hasattr(serialized_outputs, 'buffer'):
-                hidden_states_size_bytes = len(serialized_outputs.buffer)
-            
-            # 尝试获取形状信息
-            if hasattr(serialized_outputs, 'shape'):
-                hidden_states_shape = serialized_outputs.shape
-            elif hasattr(serialized_outputs, 'descriptor') and hasattr(serialized_outputs.descriptor, 'shape'):
-                hidden_states_shape = serialized_outputs.descriptor.shape
-            
-            # Profiling: Log transmission details
-            logger.info(
-                f"[PROFILING] Server-to-Server Transmission: "
-                f"From server {self.dht_prefix} to {next_peer_id.to_base58()}, "
-                f"Session: {metadata.get('session_id')}, "
-                f"Step: {metadata.get('step_id')}, "
-                f"Hidden States Shape: {hidden_states_shape}, "
-                f"Size: {hidden_states_size_bytes / (1024*1024):.2f} MB"
-            )
-
             # Sending hidden states serialized with output_schema to avoid double serialization
             next_tensors = [serialized_outputs] + request.tensors[1:]
             next_metadata = metadata.copy()
             next_metadata.update(session_id=next_session_id, next_servers=next_servers[1:], pushed=True)
 
-            # Profiling: Record start time
-            start_time = time.time()
-            
             stub = self.get_stub(self._p2p, next_peer_id)
             await stub.rpc_push(
                 runtime_pb2.ExpertRequest(
@@ -415,18 +355,6 @@ class TransformerConnectionHandler(ConnectionHandler):
                 ),
                 timeout=self.request_timeout,
             )
-            
-            # Profiling: Calculate transmission time
-            transmission_time = time.time() - start_time
-            if hidden_states_size_bytes > 0:  # 只有在成功获取数据大小时才计算吞吐量
-                logger.info(
-                    f"[PROFILING] Transmission Time: {transmission_time*1000:.2f} ms, "
-                    f"Throughput: {hidden_states_size_bytes / (1024*1024) / transmission_time:.2f} MB/s"
-                )
-            else:
-                logger.info(
-                    f"[PROFILING] Transmission Time: {transmission_time*1000:.2f} ms"
-                )
         except Exception:
             logger.debug(
                 f"Failed to push outputs to peer_id={next_peer_id}, session_id={next_session_id}, blocks={next_start}:{next_end}:",
