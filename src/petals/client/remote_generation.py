@@ -1,9 +1,10 @@
 import contextlib
 import dataclasses
 from contextvars import ContextVar
-from typing import Any, ContextManager, Dict, List, Optional, Tuple
+from typing import Any, ContextManager, Dict, List, Optional, Tuple, Sequence
 
-import torch
+
+import torch    
 import transformers
 from hivemind.utils.logging import get_logger
 from torch import Tensor

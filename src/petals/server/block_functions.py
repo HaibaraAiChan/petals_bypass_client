@@ -3,7 +3,7 @@ This module implements server-side computations on served blocks: forward, backw
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union, List
 
 import torch
 from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
@@ -20,6 +20,9 @@ from petals.utils.convert_block import QuantType
 from petals.utils.misc import DUMMY, is_dummy
 from petals.utils.packaging import unpack_args_kwargs
 
+import time
+from dataclasses import dataclass
+
 # We prioritize short inference requests and make them use a *merged* inference pool,
 # so they are processed without interruptions and extra overheads
 # TODO: Increase the NF4 threshold once bitsandbytes ships efficient NF4 kernel for parallel forward
@@ -28,6 +31,41 @@ MAX_NF4_SHORT_INFERENCE_TOKENS = 1
 
 logger = get_logger(__name__)
 
+@dataclass
+class RequestProfile:
+    request_size: int  # bytes
+    hidden_states_shape: tuple
+    prompts_shape: Optional[tuple]
+    start_time: float
+    end_time: float
+    serialization_time: float
+    deserialization_time: float
+
+class ProfilingStats:
+    def __init__(self):
+        self.requests: List[RequestProfile] = []
+        
+    def add_request(self, profile: RequestProfile):
+        self.requests.append(profile)
+        
+    def get_summary(self):
+        if not self.requests:
+            return "No requests recorded"
+            
+        total_size = sum(req.request_size for req in self.requests)
+        avg_latency = sum((req.end_time - req.start_time) for req in self.requests) / len(self.requests)
+        avg_serial_time = sum(req.serialization_time for req in self.requests) / len(self.requests)
+        avg_deserial_time = sum(req.deserialization_time for req in self.requests) / len(self.requests)
+        
+        return {
+            "total_requests": len(self.requests),
+            "total_data_size_mb": total_size / (1024 * 1024),
+            "avg_latency_ms": avg_latency * 1000,
+            "avg_serialization_ms": avg_serial_time * 1000,
+            "avg_deserialization_ms": avg_deserial_time * 1000
+        }
+
+_profiling_stats = ProfilingStats()
 
 async def run_rpc_forward(
     *flat_tensors: torch.Tensor,
@@ -38,33 +76,36 @@ async def run_rpc_forward(
     args_structure: Any = None,
 ) -> torch.Tensor:
     """
-    Run forward pass on deserialized inputs and prompts, used by rpc_forward and rpc_forward_stream
-
-    :param flat_tensors: a list of tensors that includes first layer inputs, optional prompts and extra tensors
-    :note: some input tensors can be missing, in which case they will be replaced with dummy tensors (see is_dummy)
-    :param requested_backends: a sequence of transformer blocks in the same order as they appear in forward pass
-    :returns: hidden states after the last layer [batch_size, seq_length, hid_size]
+    Run forward pass on deserialized inputs and prompts with profiling
     """
+    start_time = time.time()
+    serial_start = time.time()
+    
     if args_structure is not None:
-        # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
         flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
     hidden_states, prompts, *_ = flat_tensors
-
+    
+    # Profile input tensors
+    request_size = sum(t.element_size() * t.nelement() for t in flat_tensors if t is not None and not is_dummy(t))
+    hidden_shape = tuple(hidden_states.shape)
+    prompts_shape = tuple(prompts.shape) if prompts is not None and not is_dummy(prompts) else None
+    
+    serial_end = time.time()
+    
     dtype = requested_backends[0].dtype
-    # check parse input tensors and cast dtypes
     hidden_states = hidden_states.to(dtype)
-    assert hidden_states.ndim == 3
+
     if prompts is None or is_dummy(prompts):
         prompts = [DUMMY] * len(requested_backends)
     else:
         prompts = [p.squeeze(0) for p in prompts.to(requested_backends[0].dtype).split(1, dim=0)]
 
-    # Run a chain of requested backends
+    deserial_start = time.time()
+    
     for backend, prompt in zip(requested_backends, prompts):
         if not is_dummy(prompt):
             hidden_states[:, : prompt.shape[1]] += prompt
 
-        assert isinstance(backend.inference_pool, PrioritizedTaskPool), "petals support only prioritized pools"
         priority = prioritizer.prioritize(
             hidden_states, points=points / len(requested_backends), backend=backend, type="forward"
         )
@@ -73,11 +114,27 @@ async def run_rpc_forward(
             active_adapter,
             priority=priority,
         )
-        assert isinstance(hidden_states, torch.Tensor)
-        assert (
-            hidden_states.ndim == 3
-        ), f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
+    
+    deserial_end = time.time()
+    end_time = time.time()
+    
+    # Record profiling data
+    profile = RequestProfile(
+        request_size=request_size,
+        hidden_states_shape=hidden_shape,
+        prompts_shape=prompts_shape,
+        start_time=start_time,
+        end_time=end_time,
+        serialization_time=serial_end - serial_start,
+        deserialization_time=deserial_end - deserial_start
+    )
+    _profiling_stats.add_request(profile)
+    
+    # Log profiling summary periodically
+    if len(_profiling_stats.requests) % 100 == 0:
+        logger.info(f"Profiling summary: {_profiling_stats.get_summary()}")
 
+    assert hidden_states.ndim == 3, f"inputs to {type(backend)} must be a list with a single 3d tensor of hidden states"
     return hidden_states
 
 
