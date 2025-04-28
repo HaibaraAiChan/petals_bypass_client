@@ -194,6 +194,7 @@ class TransformerConnectionHandler(ConnectionHandler):
                         points=points,
                         quant_type=self.quant_type,
                         args_structure=args_structure,
+                        dht_prefix=self.dht_prefix,
                     ):
                         if can_push:
                             task = asyncio.create_task(self._push_outputs(request, output_tensors[0], step_metadata))

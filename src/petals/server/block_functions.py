@@ -154,6 +154,7 @@ async def iterate_rpc_inference(
     points: int,
     quant_type: QuantType,
     args_structure: Any = None,
+    dht_prefix: str = "unknown",
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
 
@@ -242,7 +243,7 @@ async def iterate_rpc_inference(
         # Profiling: Log server computation time
         session_id = step_metadata.get("session_id", "unknown")
         step_id = step_metadata.get("step_id", "unknown")
-        server_prefix = requested_backends[0].dht_prefix if requested_backends else "unknown"
+        server_prefix = dht_prefix
         
         logger.info(
             f"[PROFILING] Server Computation: "
