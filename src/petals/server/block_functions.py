@@ -4,6 +4,7 @@ This module implements server-side computations on served blocks: forward, backw
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Dict, Optional, Sequence, Tuple, Union
+import time
 
 import torch
 from hivemind.compression.serialization import deserialize_torch_tensor, serialize_torch_tensor
@@ -153,6 +154,7 @@ async def iterate_rpc_inference(
     points: int,
     quant_type: QuantType,
     args_structure: Any = None,
+    dht_prefix: str = "unknown",
 ) -> AsyncIterator[Tuple[Sequence[runtime_pb2.Tensor], bool, Dict]]:
     assert len(cache_handles) == len(requested_backends)
 
@@ -160,6 +162,9 @@ async def iterate_rpc_inference(
     point_per_piece = points / max_length if max_length > 0 else 0.0
 
     async for request, step_metadata in input_iterator:
+        # Profiling: Record start time for server computation
+        server_start_time = time.time()
+        
         if "start_from_position" in step_metadata:
             start_from_position = step_metadata["start_from_position"]
             assert (
@@ -231,6 +236,25 @@ async def iterate_rpc_inference(
             for result, proto in zip((hidden_states,), nested_flatten(requested_backends[-1].outputs_schema))
         ]
         can_push = not has_prompts
+        
+        # Profiling: Calculate server computation time
+        server_computation_time = time.time() - server_start_time
+        
+        # Profiling: Log server computation time
+        session_id = step_metadata.get("session_id", "unknown")
+        step_id = step_metadata.get("step_id", "unknown")
+        server_prefix = dht_prefix
+        
+        logger.info(
+            f"[PROFILING] Server Computation: "
+            f"Server: {server_prefix}, "
+            f"Session: {session_id}, "
+            f"Step: {step_id}, "
+            f"Computation Time: {server_computation_time*1000:.2f} ms, "
+            f"Tokens: {length_increment}, "
+            f"Latency per Token: {server_computation_time*1000/length_increment:.2f} ms/token"
+        )
+        
         yield output_tensors, can_push, step_metadata
 
         # prepare for next step
