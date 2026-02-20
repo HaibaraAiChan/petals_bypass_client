@@ -1,0 +1,46 @@
+@startuml
+skinparam componentStyle rectangle
+title KV Cache 子系统（从代码可推断的模块关系）
+
+actor Client as client
+
+component "RPC Server\n(ConnectionHandler)" as rpc
+component "Runtime Worker\n(model forward loop)" as rt
+component "KVCacheManager" as kvm
+component "MemoryCache\n(token配额+Handle映射)" as mem
+component "ExecutionEnv\n(cpu/gpu/disk/mixed)" as env
+component "Policy\n(offload/compute策略)" as pol
+component "TorchTensor / smart_copy / general_copy\n(跨设备/压缩/分段copy抽象)" as tt
+component "Model Block\n(Transformer attention)" as model
+
+database "Disk (TorchDisk)" as disk
+node "GPU" as gpu
+node "CPU" as cpu
+
+client --> rpc : request(prompt,...)
+rpc --> kvm : allocate_cache(descriptors, timeout)
+kvm --> mem : _schedule_alloc(tokens, descriptors)
+mem --> kvm : handles
+
+rpc --> kvm : use_cache(handles)
+kvm --> mem : use_cache(handles)
+mem --> kvm : cache_tensors(k_cache,v_cache)\nTorchTensor wrappers
+
+rt --> model : forward_step(...)
+model --> kvm : select_cache(prefix_length,\nkv_cache_position_ids?)
+kvm --> tt : smart_copy/general_copy\n(+MIXED拼接)
+tt --> env : compute_dst workspace\n(next_attention_compute_workspace)
+env --> gpu
+env --> cpu
+env --> disk
+
+model --> kvm : update_cache(new_kvs,start_pos)\n/update_cache_batched
+kvm --> tt : general_copy(write slices)
+
+kvm ..> pol : 决定cache device\n& attention_compute
+kvm ..> env : 提供设备对象
+
+disk <-- env
+gpu <-- env
+cpu <-- env
+@enduml
